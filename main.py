@@ -27,9 +27,17 @@ if not REDIS_URL:
         "Please set it in your .env file with your Redis Cloud connection string."
     )
 
-# Redis client (sync for simplicity)
+# Redis client with connection pooling and limits
 # Configured to use Redis Cloud from .env file
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+redis_client = redis.Redis.from_url(
+    REDIS_URL, 
+    decode_responses=True, 
+    socket_connect_timeout=5, 
+    socket_timeout=5,
+    max_connections=5,  # Limit max connections per instance
+    retry_on_timeout=True,
+    health_check_interval=30  # Check connection health
+)
 
 
 @asynccontextmanager
