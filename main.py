@@ -1153,4 +1153,7 @@ def handle_scan_url_get():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Use PORT from environment variable (Render provides this) or default to 8000 for local
+    port = int(os.getenv("PORT", 8000))
+    host = "0.0.0.0" if os.getenv("PORT") else "127.0.0.1"  # 0.0.0.0 for Render, 127.0.0.1 for local
+    uvicorn.run(app, host=host, port=port)
