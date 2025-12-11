@@ -7,7 +7,9 @@ from dotenv import load_dotenv
 import redis
 import json
 import hashlib
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, UTC
+from contextlib import asynccontextmanager
 import asyncio
 
 load_dotenv()
@@ -16,17 +18,50 @@ load_dotenv()
 NASA_API_KEY = os.getenv('NASA_API_KEY')
 HF_API_KEY = os.getenv('HF_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+REDIS_URL = os.getenv('REDIS_URL')
+
+# Validate Redis URL is configured
+if not REDIS_URL:
+    raise ValueError(
+        "REDIS_URL environment variable is required. "
+        "Please set it in your .env file with your Redis Cloud connection string."
+    )
 
 # Redis client (sync for simplicity)
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# Configured to use Redis Cloud from .env file
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup - Verify Redis Cloud connection
+    try:
+        redis_client.ping()
+        print(f"✅ Redis Cloud connected successfully!")
+        # Show partial URL for verification (hide password)
+        redis_url_display = REDIS_URL.split('@')[1] if '@' in REDIS_URL else REDIS_URL[:50]
+        print(f"   Connected to: {redis_url_display}")
+    except Exception as e:
+        print(f"❌ Redis Cloud connection failed: {e}")
+        print(f"   Please check your REDIS_URL in .env file")
+        print(f"   Current REDIS_URL: {REDIS_URL[:50]}..." if REDIS_URL else "   REDIS_URL is not set")
+        # Don't raise error - let app start but cache operations will fail gracefully
+    
+    # Startup - refresher_loop will be defined later, but Python resolves at runtime
+    try:
+        asyncio.create_task(refresher_loop())
+    except Exception as e:
+        print('Failed to start refresher loop:', e)
+    yield
+    # Shutdown (if needed)
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -242,7 +277,7 @@ def get_eonet(request: Request):
     print("/api/eonet endpoint hit")
     print("Request headers:", dict(request.headers))
     # Calculate date one month ago
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     one_month_ago = today - timedelta(days=30)
     start_date = one_month_ago.isoformat()
     cache_key = f"eonet_events_{start_date}"
@@ -267,21 +302,28 @@ def get_eonet(request: Request):
                 # Drop events that only contain null-like location texts
                 data['events'] = [e for e in data['events'] if _clean_text(e.get('description', '')) or e.get('title')]
             # Cache for 15 minutes to align with frontend polling
-            data["cached_at"] = datetime.utcnow().isoformat() + "Z"
+            data["cached_at"] = datetime.now(UTC).isoformat() + "Z"
             redis_client.setex(cache_key, 900, json.dumps(data))
         # Ensure cached_at present
         if 'cached_at' not in data:
-            data['cached_at'] = datetime.utcnow().isoformat() + 'Z'
+            data['cached_at'] = datetime.now(UTC).isoformat() + 'Z'
             print("Cached new EONET data")
         # For events missing title or description, use Gemini to generate them
         if 'events' in data:
             events = data['events'][:30]
             enhanced_events = []
-            for e in events:
+            enrichment_count = 0
+            max_enrichments = 5  # Limit enrichments per request to avoid rate limits
+            
+            for idx, e in enumerate(events):
                 needs_title = not (isinstance(e.get('title'), str) and e.get('title').strip())
                 needs_desc = not (isinstance(e.get('description'), str) and e.get('description').strip())
-                if (needs_title or needs_desc) and GEMINI_API_KEY:
+                if (needs_title or needs_desc) and GEMINI_API_KEY and enrichment_count < max_enrichments:
                     try:
+                        # Add delay between requests to avoid rate limiting
+                        if idx > 0:
+                            time.sleep(1.5)  # 1.5 second delay between requests
+                        
                         gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
                         prompt = f"Given this NASA event data: {json.dumps(e)}, generate a professional event title and a 2-3 sentence description. Respond in JSON as: {{'title': ..., 'description': ...}}. If you need to infer details, do so as an expert science communicator."
                         payload = {
@@ -294,6 +336,12 @@ def get_eonet(request: Request):
                             "X-goog-api-key": GEMINI_API_KEY
                         }
                         resp = requests.post(gemini_url, headers=headers, json=payload, timeout=30)
+                        
+                        # Handle rate limiting gracefully
+                        if resp.status_code == 429:
+                            print(f"Gemini rate limit reached, skipping enrichment for remaining events")
+                            break  # Stop trying to enrich remaining events
+                        
                         resp.raise_for_status()
                         gemini_data = resp.json()
                         text = (
@@ -314,8 +362,15 @@ def get_eonet(request: Request):
                                         e['title'] = ai_json['title']
                                     if needs_desc and 'description' in ai_json:
                                         e['description'] = ai_json['description']
+                                    enrichment_count += 1
                                 except Exception as parse_err:
                                     print('Failed to parse Gemini JSON:', parse_err)
+                    except requests.exceptions.HTTPError as http_err:
+                        if http_err.response.status_code == 429:
+                            print('Gemini rate limit exceeded, skipping remaining enrichments')
+                            break
+                        else:
+                            print('Gemini enrichment failed:', http_err)
                     except Exception as ai_err:
                         print('Gemini enrichment failed:', ai_err)
                 enhanced_events.append(e)
@@ -342,7 +397,7 @@ def get_donki():
     shape with a 'category' field, and return only the most recent records.
     Cached for 15 minutes.
     """
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(UTC)
     start_window_days = 30  # Fetch 1 month of data
     recency_hours = 720     # Show events from last 30 days (30 * 24 hours)
     cache_ttl_seconds = 15 * 60
@@ -437,14 +492,19 @@ def get_donki():
         recent_cutoff = now_utc - timedelta(hours=recency_hours)
         def parse_dt(s: str):
             try:
-                return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+                dt_str = (s or "").replace("Z", "+00:00")
+                parsed = datetime.fromisoformat(dt_str)
+                # Ensure timezone-aware (if naive, assume UTC)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return parsed
             except Exception:
                 return None
 
         filtered = []
         for it in combined:
             dt = parse_dt(it.get("startTime"))
-            if dt and dt.replace(tzinfo=None) >= recent_cutoff:
+            if dt and dt >= recent_cutoff:
                 filtered.append(it)
 
         # De-dupe by activityID/startTime+note
@@ -471,8 +531,118 @@ def get_donki():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/neo")
+def get_neo():
+    """
+    Fetch Near-Earth Objects (asteroids) from NASA NEO API.
+    Returns asteroids approaching Earth in the next 7 days.
+    Cached for 15 minutes.
+    """
+    now_utc = datetime.now(UTC)
+    start_date = now_utc.strftime("%Y-%m-%d")
+    # NEO API allows max 7 days ahead
+    end_date = (now_utc + timedelta(days=7)).strftime("%Y-%m-%d")
+    cache_ttl_seconds = 15 * 60
+    cache_key = f"neo_asteroids:{start_date}:{end_date}"
+
+    try:
+        cached = None
+        try:
+            cached = redis_client.get(cache_key)
+        except Exception as cache_err:
+            print("NEO cache read failed:", str(cache_err))
+        
+        if cached:
+            asteroids = json.loads(cached)
+        else:
+            api_key = (NASA_API_KEY or 'DEMO_KEY')
+            url = f"https://api.nasa.gov/neo/rest/v1/feed?start_date={start_date}&end_date={end_date}&api_key={api_key}"
+            
+            try:
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                print(f"NEO API fetch failed: {e}")
+                return []
+
+            asteroids = []
+            near_earth_objects = data.get('near_earth_objects', {})
+            
+            # Flatten and normalize asteroid data
+            for date_str, asteroid_list in near_earth_objects.items():
+                for asteroid in asteroid_list:
+                    # Get closest approach data
+                    close_approach = asteroid.get('close_approach_data', [{}])[0] if asteroid.get('close_approach_data') else {}
+                    
+                    # Extract diameter range
+                    diameter_meters = asteroid.get('estimated_diameter', {}).get('meters', {})
+                    diameter_min = diameter_meters.get('estimated_diameter_min', 0)
+                    diameter_max = diameter_meters.get('estimated_diameter_max', 0)
+                    
+                    # Extract miss distance and velocity
+                    miss_distance_km = float(close_approach.get('miss_distance', {}).get('kilometers', '0'))
+                    velocity_km_s = float(close_approach.get('relative_velocity', {}).get('kilometers_per_second', '0'))
+                    
+                    # Format closest approach date/time
+                    approach_date = close_approach.get('close_approach_date_full') or close_approach.get('close_approach_date', date_str)
+                    
+                    # Create normalized asteroid event
+                    asteroid_id = str(asteroid.get('id', ''))
+                    asteroid_name = asteroid.get('name', 'Unknown Asteroid')
+                    is_hazardous = asteroid.get('is_potentially_hazardous_asteroid', False)
+                    
+                    # Create description
+                    size_desc = f"{diameter_min:.0f}-{diameter_max:.0f}m" if diameter_min > 0 else "Unknown size"
+                    distance_desc = f"{miss_distance_km:,.0f} km" if miss_distance_km > 0 else "Unknown distance"
+                    velocity_desc = f"{velocity_km_s:.2f} km/s" if velocity_km_s > 0 else "Unknown velocity"
+                    
+                    description = f"Asteroid {asteroid_name} approaching Earth. Size: {size_desc}, Distance: {distance_desc}, Velocity: {velocity_desc}."
+                    if is_hazardous:
+                        description += " ⚠️ Potentially hazardous asteroid."
+                    
+                    note = f"Size: {size_desc} | Distance: {distance_desc} | Velocity: {velocity_desc}"
+                    if is_hazardous:
+                        note += " | ⚠️ HAZARDOUS"
+                    
+                    asteroids.append({
+                        "activityID": asteroid_id,
+                        "category": "Near-Earth Asteroid",
+                        "title": f"{asteroid_name} ({size_desc})",
+                        "description": description,
+                        "startTime": approach_date,
+                        "note": note,
+                        "link": asteroid.get('nasa_jpl_url', ''),
+                        "hazardous": is_hazardous,
+                        "diameter_min": diameter_min,
+                        "diameter_max": diameter_max,
+                        "velocity": velocity_km_s,
+                        "miss_distance": miss_distance_km,
+                        "orbiting_body": close_approach.get('orbiting_body', 'Earth')
+                    })
+            
+            # Sort by miss_distance (closest first)
+            asteroids.sort(key=lambda x: x.get('miss_distance', float('inf')))
+            
+            # Cache the results
+            try:
+                redis_client.setex(cache_key, cache_ttl_seconds, json.dumps(asteroids))
+            except Exception as cache_err:
+                print("NEO cache write failed:", str(cache_err))
+        
+        # Return top 20 closest asteroids
+        return asteroids[:20]
+    except Exception as e:
+        print(f"NEO endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def pre_generate_facts(events):
     """Pre-generate facts for events in the background to improve user experience"""
+    # Skip if API key is not configured
+    if not GEMINI_API_KEY:
+        return
+    
     try:
         for event in events:
             stable_id = event.get("activityID") or f"{event.get('startTime','')}|{event.get('note','')}"
@@ -490,8 +660,8 @@ def pre_generate_facts(events):
             description = f"Event Type: {event.get('category', 'Space Weather Event')}\nEvent ID: {stable_id}\nTimestamp: {event.get('startTime', 'Recent')}"
             
             try:
-                # Use Gemini API to generate summary
-                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+                # Use Gemini API to generate summary (consistent with other endpoints)
+                gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
                 payload = {
                     "contents": [{
                         "parts": [{"text": f"""Summarize this NASA space weather event in 2-3 sentences in plain English. Then, add a unique, specific fun fact about this particular event or its type, starting with 'Fun Fact:' on a new line.
@@ -507,7 +677,10 @@ Event: {title}
 Description: {description}"""}]
                     }]
                 }
-                headers = {"Content-Type": "application/json"}
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-goog-api-key": GEMINI_API_KEY
+                }
                 response = requests.post(gemini_url, json=payload, headers=headers, timeout=30)
                 response.raise_for_status()
                 result = response.json()
@@ -525,75 +698,29 @@ Description: {description}"""}]
         print(f"Pre-generation task failed: {e}")
 
 
-@app.post("/api/summary")
-def summarize(event: EventData):
-    # Validate input
-    if not isinstance(event.title, str) or not event.title.strip():
-        raise HTTPException(status_code=400, detail="Event title is required for summarization.")
-    text = event.title + ('. ' + event.description if event.description else '')
-    cache_key = f"event_summary:{event.title.strip().lower()}"
-    cached_summary = redis_client.get(cache_key)
-    if cached_summary:
-        print(f"Serving summary from cache for event: {event.title}")
-        return {"summary": cached_summary, "from_cache": True}
-    # Try Gemini API first
-    summary = None
-    if GEMINI_API_KEY:
-        try:
-            gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-            payload = {
-                "contents": [
-                    {"parts": [{"text": f"""Summarize this NASA space weather event in 2-3 sentences in plain English. Then, add a unique, specific fun fact about this particular event or its type, starting with 'Fun Fact:' on a new line.
-
-Requirements for the fun fact:
-1. Make it specific to THIS particular event (not generic)
-2. Include specific details like speed, class, location, or timing if available
-3. Make it educational and interesting
-4. Avoid generic statements like "solar flares are..." or "CMEs can travel..."
-5. Focus on what makes THIS event unique or notable
-
-Event: {text}"""}]}
-                ]
-            }
-            headers = {
-                "Content-Type": "application/json",
-                "X-goog-api-key": GEMINI_API_KEY
-            }
-            resp = requests.post(gemini_url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            summary = (
-                data.get('candidates', [{}])[0]
-                .get('content', {})
-                .get('parts', [{}])[0]
-                .get('text', None)
-            )
-            if summary:
-                redis_client.setex(cache_key, 60*60*24*7, summary)  # Cache for 7 days
-                return {"summary": summary, "from_cache": False}
-        except Exception as e:
-            print("Gemini API failed, falling back to Hugging Face. Error:", str(e))
-    # Fallback to Hugging Face
-    if HF_API_KEY:
-        try:
-            hf_url = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-            headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-            resp = requests.post(hf_url, headers=headers, json={"inputs": text}, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list) and data and 'summary_text' in data[0]:
-                summary = data[0]['summary_text']
-                redis_client.setex(cache_key, 60*60*24*7, summary)  # Cache for 7 days
-                return {"summary": summary, "from_cache": False}
-            return {"summary": "No summary available."}
-        except Exception as e:
-            print("Hugging Face API failed:", str(e))
-            raise HTTPException(status_code=500, detail="Both Gemini and Hugging Face summarization failed.")
-    raise HTTPException(status_code=500, detail="No summarization API key configured.")
+@app.get("/api/summary")
+def summary_info():
+    """Get information about the /api/summary endpoint."""
+    return {
+        "message": "This endpoint requires a POST request with JSON body",
+        "method": "POST",
+        "endpoint": "/api/summary",
+        "required_fields": {
+            "title": "string (required)",
+            "description": "string (optional)"
+        },
+        "example_request": {
+            "title": "Solar Flare X1.2",
+            "description": "A strong solar flare detected on the Sun"
+        },
+        "example_response": {
+            "summary": "Summary text with fun fact..."
+        }
+    }
 
 @app.get("/")
 def root():
-    return {"message": "GeoAurora Python API", "endpoints": ["/api/eonet", "/api/donki", "/api/summary"]}
+    return {"message": "GeoAurora Python API", "endpoints": ["/api/eonet", "/api/donki", "/api/neo", "/api/summary"]}
 
 
 # -----------------------------
@@ -602,7 +729,7 @@ def root():
 
 async def refresh_eonet_cache() -> None:
     """Prefetch EONET, enrich missing fields, filter, and store in Redis (15 min TTL)."""
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     one_month_ago = today - timedelta(days=30)
     start_date = one_month_ago.isoformat()
     cache_key = f"eonet_events_{start_date}"
@@ -614,16 +741,29 @@ async def refresh_eonet_cache() -> None:
         if 'events' in data:
             events = data['events'][:30]
             enhanced_events = []
-            for e in events:
+            enrichment_count = 0
+            max_enrichments = 3  # Limit enrichments in background refresh to avoid rate limits
+            
+            for idx, e in enumerate(events):
                 needs_title = not (isinstance(e.get('title'), str) and e.get('title').strip())
                 needs_desc = not (isinstance(e.get('description'), str) and e.get('description').strip())
-                if (needs_title or needs_desc) and GEMINI_API_KEY:
+                if (needs_title or needs_desc) and GEMINI_API_KEY and enrichment_count < max_enrichments:
                     try:
+                        # Add longer delay for background tasks to avoid rate limiting
+                        if idx > 0:
+                            time.sleep(3)  # 3 second delay between requests in background
+                        
                         gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
                         prompt = f"Given this NASA event data: {json.dumps(e)}, generate a professional event title and a 2-3 sentence description. Respond in JSON as: {'{'}'title': ..., 'description': ...{'}'}. If you need to infer details, do so as an expert science communicator."
                         payload = {"contents": [{"parts": [{"text": prompt}]}]}
                         headers = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
                         r = requests.post(gemini_url, headers=headers, json=payload, timeout=30)
+                        
+                        # Handle rate limiting gracefully
+                        if r.status_code == 429:
+                            print('Gemini rate limit in background refresh, skipping remaining')
+                            break  # Stop trying to enrich remaining events
+                        
                         r.raise_for_status()
                         gemini_data = r.json()
                         text = (
@@ -642,8 +782,15 @@ async def refresh_eonet_cache() -> None:
                                         e['title'] = ai_json['title']
                                     if needs_desc and 'description' in ai_json:
                                         e['description'] = ai_json['description']
+                                    enrichment_count += 1
                                 except Exception:
                                     pass
+                    except requests.exceptions.HTTPError as http_err:
+                        if http_err.response.status_code == 429:
+                            print('Gemini rate limit exceeded in background refresh, skipping')
+                            break
+                        else:
+                            print('Gemini enrichment (prefetch) failed:', http_err)
                     except Exception as ai_err:
                         print('Gemini enrichment (prefetch) failed:', ai_err)
                 enhanced_events.append(e)
@@ -656,7 +803,7 @@ async def refresh_eonet_cache() -> None:
 
 async def refresh_donki_cache() -> None:
     """Prefetch DONKI mixed categories and store in Redis (15 min TTL)."""
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(UTC)
     start_window_days = 30  # Fetch 1 month of data
     start_date = (now_utc - timedelta(days=start_window_days)).strftime("%Y-%m-%d")
     end_date = now_utc.strftime("%Y-%m-%d")
@@ -673,21 +820,31 @@ async def refresh_donki_cache() -> None:
         print('DONKI prefetch failed:', e)
 
 
+async def refresh_neo_cache() -> None:
+    """Prefetch NEO asteroids and store in Redis (15 min TTL)."""
+    now_utc = datetime.now(UTC)
+    start_date = now_utc.strftime("%Y-%m-%d")
+    end_date = (now_utc + timedelta(days=7)).strftime("%Y-%m-%d")
+    cache_key = f"neo_asteroids:{start_date}:{end_date}"
+    try:
+        # Trigger the endpoint to rebuild cache if needed
+        _ = get_neo()  # This will rebuild cache on miss
+        # Read and bump TTL
+        cached = redis_client.get(cache_key)
+        if cached:
+            redis_client.setex(cache_key, 900, cached)
+    except Exception as e:
+        print('NEO prefetch failed:', e)
+
+
 async def refresher_loop() -> None:
     # Initial delay a bit to allow server to come up
     await asyncio.sleep(2)
     while True:
         await refresh_eonet_cache()
         await refresh_donki_cache()
+        await refresh_neo_cache()
         await asyncio.sleep(15 * 60)
-
-
-@app.on_event("startup")
-async def on_startup():
-    try:
-        asyncio.create_task(refresher_loop())
-    except Exception as e:
-        print('Failed to start refresher loop:', e)
 
 
 # -----------------------------
@@ -914,12 +1071,12 @@ def _get_existing_key_terms() -> dict:
 
 
 @app.post("/api/summary")
-def generate_summary(request: dict):
+def generate_summary(event: EventData):
     """Generate summary with deduplication for fun facts."""
-    title = request.get("title", "")
-    description = request.get("description", "")
+    title = event.title if isinstance(event.title, str) else ""
+    description = event.description if event.description else ""
     
-    if not title:
+    if not title or not title.strip():
         raise HTTPException(status_code=400, detail="Title required")
     
     cache_key = f"detail_summary:{title.lower().strip()}"
